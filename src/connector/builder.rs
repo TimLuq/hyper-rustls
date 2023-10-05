@@ -178,19 +178,8 @@ impl ConnectorBuilder<WantsProtocols1> {
     ///
     /// For now, this could enable both HTTP 1 and 2, depending on active features.
     /// In the future, other supported versions will be enabled as well.
-    #[cfg(feature = "http2")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-    pub fn enable_all_versions(mut self) -> ConnectorBuilder<WantsProtocols3> {
-        #[cfg(feature = "http1")]
-        let alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        #[cfg(not(feature = "http1"))]
-        let alpn_protocols = vec![b"h2".to_vec()];
-
-        self.0.tls_config.alpn_protocols = alpn_protocols;
-        ConnectorBuilder(WantsProtocols3 {
-            inner: self.0,
-            enable_http1: cfg!(feature = "http1"),
-        })
+    pub fn enable_all_versions(self) -> ConnectorBuilder<WantsProtocolsAll> {
+        ConnectorBuilder(WantsProtocolsAll::new(self))
     }
 
     /// Override server name for the TLS stack
@@ -275,6 +264,59 @@ impl ConnectorBuilder<WantsProtocols3> {
         // on the Client (a higher-level object that uses the connector)
         // client.http2_only(!self.0.enable_http1);
         self.0.inner.wrap_connector(conn)
+    }
+}
+
+/// State of a builder with all enabled protocols
+///
+/// The protocols supported by this builder is dependent on the features enabled for this crate.
+/// The current set of protocol features are `http1` and `http2`.
+///
+/// At this point a connector can be built, see
+/// [`build`](ConnectorBuilder<WantsProtocolsAll>::build) and
+/// [`wrap_connector`](ConnectorBuilder<WantsProtocolsAll>::wrap_connector).
+pub struct WantsProtocolsAll {
+    #[cfg(feature = "http2")]
+    inner: WantsProtocols3,
+    #[cfg(all(not(feature = "http2"), feature = "http1"))]
+    inner: WantsProtocols2,
+    #[cfg(all(not(feature = "http2"), not(feature = "http1")))]
+    inner: WantsProtocols1,
+}
+
+impl WantsProtocolsAll {
+    /// Applies all enabled protocols to the given builder
+    fn new(inner: ConnectorBuilder<WantsProtocols1>) -> Self {
+        #[cfg(feature = "http1")]
+        let inner = inner.enable_http1();
+        #[cfg(feature = "http2")]
+        let inner = inner.enable_http2();
+
+        let ConnectorBuilder(inner) = inner;
+        Self { inner }
+    }
+}
+
+impl ConnectorBuilder<WantsProtocolsAll> {
+    /// This builds an [`HttpsConnector`] built on hyper's default [`HttpConnector`]
+    #[cfg(feature = "tokio-runtime")]
+    pub fn build(self) -> HttpsConnector<HttpConnector> {
+        #[cfg(any(feature = "http2", feature = "http1"))]
+        let inner = ConnectorBuilder(self.0.inner);
+        #[cfg(all(not(feature = "http2"), not(feature = "http1")))]
+        let inner = self.0.inner;
+
+        inner.build()
+    }
+
+    /// This wraps an arbitrary low-level connector into an [`HttpsConnector`]
+    pub fn wrap_connector<H>(self, conn: H) -> HttpsConnector<H> {
+        #[cfg(any(feature = "http2", feature = "http1"))]
+        let inner = ConnectorBuilder(self.0.inner);
+        #[cfg(all(not(feature = "http2"), not(feature = "http1")))]
+        let inner = self.0.inner;
+
+        inner.wrap_connector(conn)
     }
 }
 
@@ -372,5 +414,61 @@ mod tests {
             .enable_all_versions()
             .build();
         assert_eq!(&connector.tls_config.alpn_protocols, &[b"h2".to_vec()]);
+    }
+
+    #[test]
+    #[cfg(all(not(feature = "http2"), feature = "http1"))]
+    fn test_alpn_http1() {
+        let roots = rustls::RootCertStore::empty();
+        let tls_config = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = super::ConnectorBuilder::new()
+            .with_tls_config(tls_config.clone())
+            .https_only()
+            .enable_http1()
+            .build();
+        assert!(
+            connector
+                .tls_config
+                .alpn_protocols
+                .is_empty(),
+            "ALPN protocols should be empty when only HTTP1 is enabled"
+        );
+        let connector = super::ConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            .https_only()
+            .enable_all_versions()
+            .build();
+        assert!(
+            connector
+                .tls_config
+                .alpn_protocols
+                .is_empty(),
+            "ALPN protocols should be empty when only HTTP1 is enabled"
+        );
+    }
+
+    #[test]
+    #[cfg(all(not(feature = "http2"), not(feature = "http1")))]
+    fn test_alpn_no_protocol() {
+        let roots = rustls::RootCertStore::empty();
+        let tls_config = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = super::ConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            .https_only()
+            .enable_all_versions()
+            .build();
+        assert!(
+            connector
+                .tls_config
+                .alpn_protocols
+                .is_empty(),
+            "ALPN protocols should be empty when no protocol is enabled"
+        );
     }
 }
